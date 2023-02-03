@@ -1,0 +1,59 @@
+trigger PaymentTrigger on npe01__OppPayment__c (before insert, before update) {
+
+    if (Trigger.isBefore) {
+        List<npe01__OppPayment__c> pmtsRequiringConversion = new List<npe01__OppPayment__c>();
+        Set<String> currencies = new Set<String>();
+        for (npe01__OppPayment__c pmt : Trigger.new) {
+            if (Trigger.isInsert || (Trigger.isUpdate && (Trigger.oldMap.get(pmt.Id).npe01__Paid__c != pmt.npe01__Paid__c || Trigger.oldMap.get(pmt.Id).npe01__Scheduled_Date__c != pmt.npe01__Scheduled_Date__c || Trigger.oldMap.get(pmt.Id).npe01__Payment_Date__c != pmt.npe01__Payment_Date__c || Trigger.oldMap.get(pmt.Id).npe01__Payment_Amount__c != pmt.npe01__Payment_Amount__c || (!Trigger.oldMap.get(pmt.Id).Recalculate_Converted_Amount__c && pmt.Recalculate_Converted_Amount__c)))) {
+                pmtsRequiringConversion.add(pmt);
+                currencies.add(pmt.CurrencyIsoCode);
+            }
+        }
+        if (!pmtsRequiringConversion.isEmpty()) {
+            List<DatedConversionRate> DCRs = [SELECT IsoCode, StartDate, NextStartDate, ConversionRate
+                                              FROM DatedConversionRate
+                                              WHERE IsoCode IN :currencies
+                                              ORDER BY IsoCode, StartDate DESC];
+            Map<String, List<DatedConversionRate>> currencyToFXRates = new Map<String, List<DatedConversionRate>>();
+            for (DatedConversionRate dcr : DCRs) {
+                if (!currencyToFXRates.containsKey(dcr.IsoCode)) {
+                    currencyToFXRates.put(dcr.IsoCode, new List<DatedConversionRate>{dcr});
+                }
+                else {
+                    currencyToFXRates.get(dcr.IsoCode).add(dcr);
+                }
+            }
+            for (npe01__OppPayment__c pmt : pmtsRequiringConversion) {
+                Decimal conversionRate;
+                List<DatedConversionRate> conversionRates;
+                if (pmt.npe01__Paid__c && pmt.npe01__Payment_Date__c != null && pmt.CurrencyIsoCode != 'USD') {
+                    conversionRates = currencyToFXRates.get(pmt.CurrencyIsoCode);
+                    for (DatedConversionRate dcr : conversionRates) {
+                        if (dcr.StartDate <= pmt.npe01__Payment_Date__c && dcr.NextStartDate > pmt.npe01__Payment_Date__c) {
+                            conversionRate = dcr.ConversionRate;
+                            break;
+                        }
+                    }
+                }
+                else if (!pmt.npe01__Paid__c && pmt.npe01__Scheduled_Date__c != null && pmt.CurrencyIsoCode != 'USD') {
+                    conversionRates = currencyToFXRates.get(pmt.CurrencyIsoCode);
+                    for (DatedConversionRate dcr : conversionRates) {
+                        if (dcr.StartDate <= pmt.npe01__Scheduled_Date__c && dcr.NextStartDate > pmt.npe01__Scheduled_Date__c) {
+                            conversionRate = dcr.ConversionRate;
+                            break;
+                        }
+                    }                
+                }
+                else if (pmt.CurrencyIsoCode == 'USD') {conversionRate = 1.00;}
+                if (pmt.npe01__Payment_Amount__c != null && conversionRate != null) {
+                    Decimal amtInUSD = pmt.npe01__Payment_Amount__c/conversionRate;
+                    pmt.Converted_Amount_Dated__c = amtInUSD.setScale(2);
+                }
+                pmt.Recalculate_Converted_Amount__c = false;
+            }
+        }
+        
+        
+    }
+    
+}
