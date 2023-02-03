@@ -1,0 +1,497 @@
+public class HardAndSoftCreditTriggerHandler {
+    
+    public static List<User> rtrUser = [SELECT Id FROM User WHERE Name = 'Room to Read' LIMIT 1];
+    
+    // Make generic RtR user default owner of all opps
+    public static void beforeOppInsert(List<Opportunity> opps) {
+        for (Opportunity o : opps) {
+            o.OwnerId = !rtrUser.isEmpty() ? rtrUser[0].Id : UserInfo.getUserId();
+        }
+    }
+    
+	// Recalculate account currency after every opp insert
+    public static void afterOppInsert(List<Opportunity> opps) {
+		Set<Id> acctIds = new Set<Id>();      
+        for (Opportunity o : opps) {
+            acctIds.add(o.AccountId);
+        }       
+        List<Contact> allHouseholdMembers = [SELECT Id FROM Contact WHERE AccountId IN :acctIds];
+        Set<Id> contactIds = new Set<Id>();
+        for (Contact c : allHouseholdMembers) {
+            contactIds.add(c.Id);
+        }
+        setAcctCurrency(contactIds, acctIds);
+    }
+    
+    //Prevent an opportunity from being double-credited to the same account
+    public static void beforePartialSoftCredInsert(List<npsp__Partial_Soft_Credit__c> partialSoftCredits) {
+        Set<Id> oppIds = new Set<Id>();
+        Set<Id> contactIds = new Set<Id>();
+        for (npsp__Partial_Soft_Credit__c softCred : partialSoftCredits) {
+            oppIds.add(softCred.npsp__Opportunity__c);
+            contactIds.add(softCred.npsp__Contact__c);
+        }
+        List<Opportunity> opps = [SELECT Id, AccountId FROM Opportunity WHERE Id IN :oppIds];
+        Map<Id, Id> oppIdToAcctId = new Map<Id, Id>();
+        for (Opportunity o : opps) {
+            oppIdToAcctId.put(o.Id, o.AccountId);
+        }
+        List<Contact> contacts = [SELECT Id, AccountId FROM Contact WHERE Id IN :contactIds];
+        Map<Id, Id> contactIdToAcctId = new Map<Id, Id>();
+        for (Contact c : contacts) {
+            contactIdToAcctId.put(c.Id, c.AccountId);
+        }
+        for (npsp__Partial_Soft_Credit__c softCred : partialSoftCredits) {
+            if (oppIdToAcctId.get(softCred.npsp__Opportunity__c) == contactIdToAcctId.get(softCred.npsp__Contact__c)) {
+                softCred.addError('Do not soft credit a contact for an opportunity that\'s already been hard credited to their account');
+            }
+        }
+        List<npsp__Partial_Soft_Credit__c> existingContactSoftCreds = [SELECT Id, npsp__Opportunity__c, npsp__Opportunity__r.Amount, 
+                                                               		   npsp__Contact__c, npsp__Contact__r.AccountId, npsp__Amount__c
+                                                               		   FROM npsp__Partial_Soft_Credit__c
+                                                               		   WHERE npsp__Opportunity__c IN :oppIds AND npsp__Contact__r.AccountId IN :contactIdToAcctId.values()];
+		List<npsp__Account_Soft_Credit__c> existingAcctSoftCreds = [SELECT Id, npsp__Opportunity__c, npsp__Opportunity__r.Amount, 
+                                                                    npsp__Account__c, npsp__Amount__c
+                                                                    FROM npsp__Account_Soft_Credit__c
+                                                                    WHERE npsp__Opportunity__c IN :oppIds AND npsp__Account__c IN :contactIdToAcctId.values()];
+        for (npsp__Partial_Soft_Credit__c existingContactSoftCred : existingContactSoftCreds) {
+            // Only checking for duplicates on soft credits for 100% of opportunity amount (to avoid throwing errors on HM Revenue & Custom soft credits, for instance)
+            if (existingContactSoftCred.npsp__Amount__c == existingContactSoftCred.npsp__Opportunity__r.Amount) {
+                for (npsp__Partial_Soft_Credit__c newSoftCred : partialSoftCredits) {
+                    if (newSoftCred.npsp__Opportunity__c == existingContactSoftCred.npsp__Opportunity__c && contactIdToAcctId.get(newSoftCred.npsp__Contact__c) == existingContactSoftCred.npsp__Contact__r.AccountId) {
+                        newSoftCred.addError('Do not soft credit an opportunity to the same account twice');
+                    }
+                }
+            }
+        }
+        for (npsp__Account_Soft_Credit__c existingAcctSoftCred : existingAcctSoftCreds) {
+            if ((existingAcctSoftCred.npsp__Amount__c == existingAcctSoftCred.npsp__Opportunity__r.Amount) || existingAcctSoftCred.Percent__c == 100) {
+                for (npsp__Partial_Soft_Credit__c newSoftCred : partialSoftCredits) {
+                    if (newSoftCred.npsp__Opportunity__c == existingAcctSoftCred.npsp__Opportunity__c && contactIdToAcctId.get(newSoftCred.npsp__Contact__c) == existingAcctSoftCred.npsp__Account__c) {
+                        newSoftCred.addError('Do not soft credit an opportunity to the same account twice');
+                    }
+                }
+            }
+        }
+      
+    }
+        
+    // Recalculate account currency after every partial soft credit insert
+    public static void afterPartialSoftCredInsert(List<npsp__Partial_Soft_Credit__c> partialSoftCredits) {
+        Set<Id> contactIds = new Set<Id>();
+        for (npsp__Partial_Soft_Credit__c softCred : partialSoftCredits) {
+            contactIds.add(softCred.npsp__Contact__c);
+        }
+        List<Contact> contacts = [SELECT Id, AccountId FROM Contact WHERE Id IN :contactIds];
+        Set<Id> acctIds = new Set<Id>();
+        for (Contact c : contacts) {
+            acctIds.add(c.AccountId);
+        }
+        setAcctCurrency(contactIds, acctIds);
+    }
+    
+    // Prevent an opportunity from being double-credited to the same account
+    public static void beforeAccountSoftCredInsert(List<npsp__Account_Soft_Credit__c> acctSoftCredits) {
+        Set<Id> oppIds = new Set<Id>();
+        Set<Id> acctIds = new Set<Id>();
+        for (npsp__Account_Soft_Credit__c softCred : acctSoftCredits) {
+            oppIds.add(softCred.npsp__Opportunity__c);
+            acctIds.add(softCred.npsp__Account__c);
+        }
+        Map<Id, Opportunity> oppMap = new Map<Id, Opportunity>([SELECT Id, AccountId, Amount FROM Opportunity WHERE Id IN :oppIds]);
+        for (npsp__Account_Soft_Credit__c softCred : acctSoftCredits) {
+			if (softCred.Percent__c > 0) {
+                softCred.npsp__Amount__c = softCred.Percent__c/100*oppMap.get(softCred.npsp__Opportunity__c).Amount;
+            }
+        }
+        for (npsp__Account_Soft_Credit__c softCred : acctSoftCredits) {
+            if (softCred.npsp__Account__c == oppMap.get(softCred.npsp__Opportunity__c).AccountId) {
+                softCred.addError('Do not soft credit an account for an opportunity that\'s already been hard credited to it');
+            }
+        }
+        List<npsp__Partial_Soft_Credit__c> existingContactSoftCreds = [SELECT Id, npsp__Opportunity__c, npsp__Opportunity__r.Amount, 
+                                                               		   npsp__Contact__c, npsp__Contact__r.AccountId, npsp__Amount__c
+                                                               		   FROM npsp__Partial_Soft_Credit__c
+                                                               		   WHERE npsp__Opportunity__c IN :oppIds AND npsp__Contact__r.AccountId IN :acctIds];
+		List<npsp__Account_Soft_Credit__c> existingAcctSoftCreds = [SELECT Id, npsp__Opportunity__c, npsp__Opportunity__r.Amount, 
+                                                                    npsp__Account__c, npsp__Amount__c
+                                                                    FROM npsp__Account_Soft_Credit__c
+                                                                    WHERE npsp__Opportunity__c IN :oppIds AND npsp__Account__c IN :acctIds];
+        for (npsp__Partial_Soft_Credit__c existingContactSoftCred : existingContactSoftCreds) {
+            // Only checking for duplicates on soft credits for 100% of opportunity amount (to avoid throwing errors on HM Revenue & Custom soft credits, for instance)
+            if (existingContactSoftCred.npsp__Amount__c == existingContactSoftCred.npsp__Opportunity__r.Amount) {
+                for (npsp__Account_Soft_Credit__c newSoftCred : acctSoftCredits) {
+                    if (newSoftCred.npsp__Opportunity__c == existingContactSoftCred.npsp__Opportunity__c && newSoftCred.npsp__Account__c == existingContactSoftCred.npsp__Contact__r.AccountId) {
+                        newSoftCred.addError('Do not soft credit an opportunity to the same account twice');
+                    }
+                }
+            }
+        }
+        for (npsp__Account_Soft_Credit__c existingAcctSoftCred : existingAcctSoftCreds) {
+            if (existingAcctSoftCred.npsp__Amount__c == existingAcctSoftCred.npsp__Opportunity__r.Amount) {
+                for (npsp__Account_Soft_Credit__c newSoftCred : acctSoftCredits) {
+                    if (newSoftCred.npsp__Opportunity__c == existingAcctSoftCred.npsp__Opportunity__c && newSoftCred.npsp__Account__c == existingAcctSoftCred.npsp__Account__c) {
+                        newSoftCred.addError('Do not soft credit an opportunity to the same account twice');
+                    }
+                }
+            }
+        }        
+    }
+        
+    
+    // Recalculate account currency after insert of new account soft credit
+    public static void afterAccountSoftCredInsert(List<npsp__Account_Soft_Credit__c> acctSoftCredits) {
+        Set<Id> acctIds = new Set<Id>();
+        for (npsp__Account_Soft_Credit__c softCred : acctSoftCredits) {
+            acctIds.add(softCred.npsp__Account__c);
+        }
+        List<Contact> contacts = [SELECT Id FROM Contact WHERE AccountId IN :acctIds];
+        Set<Id> contactIds = new Set<Id>();
+        for (Contact c : contacts) {
+            contactIds.add(c.Id);
+        }
+        setAcctCurrency(contactIds, acctIds);
+    }
+    
+    public static void setAcctCurrency(Set<Id> contactIds, Set<Id> acctIds) {
+        
+		// Query all gifts on accounts with new hard or soft credits
+        List<Opportunity> donations = [SELECT Id, AccountId, CurrencyIsoCode, CloseDate
+                                       FROM Opportunity
+                                       WHERE AccountId IN :acctIds AND (RecordType.Name = 'Donation'
+                                       OR RecordType.Name = 'Grant' OR RecordType.Name = 'Conditional Grant'
+                                       OR RecordType.Name = 'Major Gift')
+                                       ORDER BY AccountId, CurrencyIsoCode, CloseDate DESC];
+        // Query all partial soft credits on accounts with new hard or soft credits
+        List<npsp__Partial_Soft_Credit__c> partialSoftCredits = 
+            [SELECT npsp__Contact__r.AccountId, CurrencyIsoCode, npsp__Opportunity__r.CloseDate 
+			 FROM npsp__Partial_Soft_Credit__c
+			 WHERE npsp__Contact__c IN :contactIds
+             ORDER BY npsp__Contact__r.AccountId, CurrencyIsoCode, npsp__Opportunity__r.CloseDate DESC];
+		
+        // Query all account soft credits on accounts with new hard or soft credits
+        List<npsp__Account_Soft_Credit__c> acctSoftCredits =
+            [SELECT npsp__Account__c, CurrencyIsoCode, npsp__Opportunity__r.CloseDate
+             FROM npsp__Account_Soft_Credit__c
+             WHERE npsp__Account__c IN :acctIds
+             ORDER BY npsp__Account__c, CurrencyIsoCode, npsp__Opportunity__r.CloseDate DESC];
+        
+        // The rather byzantine map structure below allows for maintenance of running 
+        // count of hard and soft credits per currency per account -- we add to count as
+        // we iterate over each set of query results
+        Map<Id, List<Map<String, Integer>>> acctIdToCurrencyToCount = new Map<Id, List<Map<String, Integer>>>();
+        for (Opportunity o : donations) {
+            if (!acctIdToCurrencyToCount.containsKey(o.AccountId)) {
+                acctIdToCurrencyToCount.put(o.AccountId, new List<Map<String, Integer>>());
+                Map<String, Integer> currencyToCount = new Map<String, Integer>();
+                currencyToCount.put(o.CurrencyIsoCode, 1);
+                acctIdToCurrencyToCount.get(o.AccountId).add(currencyToCount);
+            }
+            else {
+                List<Map<String, Integer>> currencyCounts = acctIdToCurrencyToCount.get(o.AccountId);
+                Set<String> mappedCurrencies = new Set<String>();
+                for (Map<String, Integer> currencyToCount : currencyCounts) {
+                    mappedCurrencies.addAll(currencyToCount.keySet());
+                    if (currencyToCount.containsKey(o.CurrencyIsoCode)) {
+                        Integer currentCt = currencyToCount.get(o.CurrencyIsoCode);
+                        currentCt += 1;
+                        currencyToCount.put(o.CurrencyIsoCode, currentCt);
+                    }
+                }
+                if (!mappedCurrencies.contains(o.CurrencyIsoCode)) {
+                    Map<String, Integer> currencyToCount = new Map<String, Integer>();
+                    currencyToCount.put(o.CurrencyIsoCode, 1);
+                    acctIdToCurrencyToCount.get(o.AccountId).add(currencyToCount);                    
+                }
+            }
+        }
+        for (npsp__Partial_Soft_Credit__c softCred : partialSoftCredits) {
+             if (!acctIdToCurrencyToCount.containsKey(softCred.npsp__Contact__r.AccountId)) {
+                acctIdToCurrencyToCount.put(softCred.npsp__Contact__r.AccountId, new List<Map<String, Integer>>());
+                Map<String, Integer> currencyToCount = new Map<String, Integer>();
+                currencyToCount.put(softCred.CurrencyIsoCode, 1);
+                acctIdToCurrencyToCount.get(softCred.npsp__Contact__r.AccountId).add(currencyToCount);
+            }
+            else {
+                List<Map<String, Integer>> currencyCounts = acctIdToCurrencyToCount.get(softCred.npsp__Contact__r.AccountId);
+                Set<String> mappedCurrencies = new Set<String>();
+                for (Map<String, Integer> currencyToCount : currencyCounts) {
+                    mappedCurrencies.addAll(currencyToCount.keySet());
+                    if (currencyToCount.containsKey(softCred.CurrencyIsoCode)) {
+                        Integer currentCt = currencyToCount.get(softCred.CurrencyIsoCode);
+                        currentCt += 1;
+                        currencyToCount.put(softCred.CurrencyIsoCode, currentCt);
+                    }
+                }
+                if (!mappedCurrencies.contains(softCred.CurrencyIsoCode)) {
+                    Map<String, Integer> currencyToCount = new Map<String, Integer>();
+                    currencyToCount.put(softCred.CurrencyIsoCode, 1);
+                    acctIdToCurrencyToCount.get(softCred.npsp__Contact__r.AccountId).add(currencyToCount);                    
+                }
+            }           
+        }
+        for (npsp__Account_Soft_Credit__c softCred : acctSoftCredits) {
+             if (!acctIdToCurrencyToCount.containsKey(softCred.npsp__Account__c)) {
+                acctIdToCurrencyToCount.put(softCred.npsp__Account__c, new List<Map<String, Integer>>());
+                Map<String, Integer> currencyToCount = new Map<String, Integer>();
+                currencyToCount.put(softCred.CurrencyIsoCode, 1);
+                acctIdToCurrencyToCount.get(softCred.npsp__Account__c).add(currencyToCount);
+            }
+            else {
+                List<Map<String, Integer>> currencyCounts = acctIdToCurrencyToCount.get(softCred.npsp__Account__c);
+                Set<String> mappedCurrencies = new Set<String>();
+                for (Map<String, Integer> currencyToCount : currencyCounts) {
+                    mappedCurrencies.addAll(currencyToCount.keySet());
+                    if (currencyToCount.containsKey(softCred.CurrencyIsoCode)) {
+                        Integer currentCt = currencyToCount.get(softCred.CurrencyIsoCode);
+                        currentCt += 1;
+                        currencyToCount.put(softCred.CurrencyIsoCode, currentCt);
+                    }
+                }
+                if (!mappedCurrencies.contains(softCred.CurrencyIsoCode)) {
+                    Map<String, Integer> currencyToCount = new Map<String, Integer>();
+                    currencyToCount.put(softCred.CurrencyIsoCode, 1);
+                    acctIdToCurrencyToCount.get(softCred.npsp__Account__c).add(currencyToCount);                    
+                }
+            }            
+        }
+
+        // Query all accounts with new hard or soft credits
+        List<Account> acctsWithNewCreds = [SELECT Id, Name, CurrencyISOCode FROM Account WHERE Id IN :acctIds];
+        List<Account> acctsToUpdate = new List<Account>();
+        
+        // Iterate over running counts of credits per currency per account and update
+        // below maps as we go, keeping track of currency with the most credits
+        Map<Id, Integer> acctIdToHighestCount = new Map<Id, Integer>();
+        Map<Id, String> acctIdToISOCode = new Map<Id, String>();
+        for (Id acctId : acctIdToCurrencyToCount.keySet()) {
+            Integer highestCount;
+            List<Map<String, Integer>> listOfMaps = acctIdToCurrencyToCount.get(acctId);
+            for (Map<String, Integer> currencyToCount : listOfMaps) {
+                String curr;
+                for (String currencyIsoCode : currencyToCount.keySet()) {
+                    curr = currencyIsoCode;
+                    Integer count = currencyToCount.get(curr);
+                    if (!acctIdToHighestCount.containsKey(acctId) || count > acctIdToHighestCount.get(acctId)) {
+                        acctIdToHighestCount.put(acctId, count);
+                        acctIdToISOCode.put(acctId, curr);
+                    }
+                }
+            }
+        }
+        
+        // If currency with highest count is different from current account currency,
+        // add to list of accounts to update
+        for (Account acct : acctsWithNewCreds) {
+            if (acct.CurrencyISOCode!=acctIdToISOCode.get(acct.Id)) {
+                acct.CurrencyISOCode=acctIdToISOCode.get(acct.Id);
+                acctsToUpdate.add(acct);
+            }
+        }
+        if (!acctsToUpdate.isEmpty()) {
+            Database.saveResult[] saveResults = Database.update(acctsToUpdate, false);
+            for (Integer i=0;i<saveResults.size();i++) {
+                if (saveResults.get(i).isSuccess()) {
+                    // Operation was successful, so get the ID of the record that was processed
+                    System.debug('Successfully updated account record. Account Id: ' + saveResults.get(i).getId());
+                }
+                else {
+                    System.debug('The following error has occurred:');                    
+                    Database.Error error = saveResults.get(i).getErrors().get(0);
+                    System.debug(error.getMessage());
+                    System.debug('Id of record that failed to update: ' + acctsToUpdate[i].Id);
+                }
+            }
+        }
+    }
+    
+    // This Apex method covered by unit test written for GAUAllocationTrigger 
+    public static void copyAllocationInfoToPmts(Set<Id> oppIds, Map<Id, Opportunity> newOppMap) {
+        // If payment allocations turned on, link to supporting docs will be copied onto those; otherwise
+        // link will be copied directly onto payment
+        List<npsp__Allocation__c> pmtAllocations = [SELECT Id, npsp__Payment__r.npe01__Opportunity__c FROM npsp__Allocation__c WHERE npsp__Payment__r.npe01__Opportunity__c IN :oppIds];
+        List<npsp__Allocation__c> pmtAllocationsToUpdate = new List<npsp__Allocation__c>();
+        if (!pmtAllocations.isEmpty()) {
+            for (npsp__Allocation__c alloc : pmtAllocations) {
+                alloc.Link_to_Supporting_Docs_for_GAU__c = newOppMap.get(alloc.npsp__Payment__r.npe01__Opportunity__c).Link_to_Supporting_Docs_for_GAU__c;
+				pmtAllocationsToUpdate.add(alloc);
+            }
+            if (!pmtAllocationsToUpdate.isEmpty()) {Database.update(pmtAllocationsToUpdate, false);}
+        }
+        else {
+            List<npe01__OppPayment__c> pmts = [SELECT Id, npe01__Opportunity__c, Link_to_Supporting_Docs_for_GAU__c, GAU_s__c
+                                               FROM npe01__OppPayment__c
+                                               WHERE npe01__Opportunity__c IN :oppIds];
+            List<npe01__OppPayment__c> pmtsToUpdate = new List<npe01__OppPayment__c>();
+            for (npe01__OppPayment__c pmt : pmts) {
+                pmt.Link_to_Supporting_Docs_for_GAU__c = newOppMap.get(pmt.npe01__Opportunity__c).Link_to_Supporting_Docs_for_GAU__c;
+                pmt.GAU_s__c = newOppMap.get(pmt.npe01__Opportunity__c).GAU_s__c;
+                pmtsToUpdate.add(pmt);
+            }
+            if (!pmtsToUpdate.isEmpty()) {Database.update(pmtsToUpdate, false);}             
+        }       
+    }
+    
+    public static void softCreditGivingArmDonors(Set<Id> acctIds, List<npe5__Affiliation__c> affiliations, List<Opportunity> opps) {
+        // Map Ids of giving arm organizations to sets of Ids of the affiliated household
+        // accounts, to determine whether this org is the giving arm of multiple
+        // households or just one (if it is a giving arm for more than one household, soft
+        // credits will need to be created manually)
+        Map<Id, Set<Id>> givingArmToAffiliatedHouseholdAccountIds = new Map<Id, Set<Id>>();
+        Map<Id, Decimal> householdAcctIdToNumberOfOpenGrantsMGs = new Map<Id, Decimal>();
+        Map<Id, Id> contactToAccountIds = new Map<Id, Id>();
+        for (npe5__Affiliation__c affiliation : affiliations) {
+            if (!givingArmToAffiliatedHouseholdAccountIds.containsKey(affiliation.npe5__Organization__c)) {
+                givingArmToAffiliatedHouseholdAccountIds.put(affiliation.npe5__Organization__c, new Set<Id>{affiliation.npe5__Contact__r.AccountId});
+            }
+            else {givingArmToAffiliatedHouseholdAccountIds.get(affiliation.npe5__Organization__c).add(affiliation.npe5__Contact__r.AccountId);}
+            if (!householdAcctIdToNumberOfOpenGrantsMGs.containsKey(affiliation.npe5__Contact__r.AccountId)) {
+                householdAcctIdToNumberOfOpenGrantsMGs.put(affiliation.npe5__Contact__r.AccountId, affiliation.npe5__Contact__r.Account.Count_of_Open_Grants_Major_Gifts__c);
+            }
+            if (!contactToAccountIds.containsKey(affiliation.npe5__Contact__c)) {
+                contactToAccountIds.put(affiliation.npe5__Contact__c, affiliation.npe5__Contact__r.AccountId);
+            }
+        }
+        // Now create map of giving arm Ids to all hard credits just inserted, and set containing all opp Ids
+		Map<Id, List<Opportunity>> givingArmIdToRelatedOpps = new Map<Id, List<Opportunity>>();
+        for (Opportunity o : opps) {
+            if (givingArmToAffiliatedHouseholdAccountIds.containsKey(o.AccountId)) {
+                if (!givingArmIdToRelatedOpps.containsKey(o.AccountId)) {
+                    givingArmIdToRelatedOpps.put(o.AccountId, new List<Opportunity>{o});
+                }
+                else {givingArmIdToRelatedOpps.get(o.AccountId).add(o);}                    
+            }
+        }
+        
+		List<CollaborationGroup> gbo = [SELECT Id, Name FROM CollaborationGroup WHERE Name = 'GBO' LIMIT 1];
+		List<npsp__Account_Soft_Credit__c> acctSoftCreditsToInsert = new List<npsp__Account_Soft_Credit__c>();        
+        for (Id givingArmId : givingArmToAffiliatedHouseholdAccountIds.keySet()) {
+            // Check to make sure giving arm serves no more than one account
+            if (givingArmToAffiliatedHouseholdAccountIds.get(givingArmId).size() == 1) {
+                for (Id householdAcctId : givingArmToAffiliatedHouseholdAccountIds.get(givingArmId)) {
+                    for (Opportunity o : givingArmIdToRelatedOpps.get(givingArmId)) {
+                        // If primary contact has been linked to gift, they will automatically be soft credited
+                        // at the contact level, so no need to create an account soft credit
+                        if (String.isBlank(o.npsp__Primary_Contact__c)) {
+                            npsp__Account_Soft_Credit__c acctSoftCred = new npsp__Account_Soft_Credit__c(
+                                npsp__Opportunity__c = o.Id,
+                                npsp__Account__c = householdAcctId,
+                                npsp__Amount__c = o.Amount,
+                                CurrencyIsoCode = o.CurrencyIsoCode,
+                                npsp__Role__c = 'Donation Source');
+                            acctSoftCreditsToInsert.add(acctSoftCred);
+                        }
+                        if (householdAcctIdToNumberOfOpenGrantsMGs.get(householdAcctId) > 0 && FirstRunHelperClass.firstRun && o.CloseDate.year() == System.today().year()) {
+                            // Post chatter alert in case gift coming through giving arm represents the fulfillment of
+                            // commitment made in relation to a major gift on the related household
+                            ConnectApi.FeedItemInput feedItemInput = new ConnectApi.FeedItemInput();                
+                            ConnectApi.MentionSegmentInput mentionSegmentInput = new ConnectApi.MentionSegmentInput();
+                            ConnectApi.MessageBodyInput messageBodyInput = new ConnectApi.MessageBodyInput();
+                            
+                            messageBodyInput.messageSegments = new List<ConnectApi.MessageSegmentInput>();
+                            
+                            ConnectApi.TextSegmentInput textSegmentInput1 = new ConnectApi.TextSegmentInput();                
+                            textSegmentInput1.text = 'Hey, ';
+                            messageBodyInput.messageSegments.add(textSegmentInput1);
+                            
+                            if (!gbo.isEmpty()) {
+                                mentionSegmentInput.id = gbo[0].Id;
+                                messageBodyInput.messageSegments.add(mentionSegmentInput);
+                            }
+                            else {
+                                ConnectApi.TextSegmentInput textSegmentInput2 = new ConnectApi.TextSegmentInput();                    
+                                textSegmentInput2.text = 'GBO Team';
+                                messageBodyInput.messageSegments.add(textSegmentInput2);                    
+                            }
+                            
+                            ConnectApi.TextSegmentInput textSegmentInput3 = new ConnectApi.TextSegmentInput();
+                            textSegmentInput3.text = ': The account to which this hard credit just posted appears to be the giving arm for a household with at least one open major gift or grant. ' +
+                                'Please determine if the credit should be applied to the open gift, and if it should, change the record type and name on the giving arm credit to match the household gift, ' +
+                                'then delete the latter; or, if the credit represents only a portion of the amount expected on the household gift, ' +
+                                'link the credit to the open gift and update the remaining projected amount.';
+                            messageBodyInput.messageSegments.add(textSegmentInput3);                
+                            
+                            feedItemInput.body = messageBodyInput;
+                            feedItemInput.feedElementType = ConnectApi.FeedElementType.FeedItem;
+                            feedItemInput.subjectId = o.Id;
+                            if (!Test.isRunningTest()) {
+                                ConnectApi.ChatterFeeds.postFeedElement(Network.getNetworkId(), feedItemInput);
+                            	FirstRunHelperClass.firstRun = false;
+                            }                             
+                        }
+                    }
+                }
+            }
+            // If the organizational account is a giving arm for more than one household,
+            // post a message to Chatter
+            else {
+                for (Opportunity o : givingArmIdToRelatedOpps.get(givingArmId)) {
+                    // If gift has been moved from a household to a giving arm account, the primary contact on the gift will
+                    // have been deleted to facilitate the automatic creation of an account soft credit; nevertheless, the contact's
+                    // Id will still reside on the opportunity record in connection with the donor's opportunity contact role. We
+                    // can make use of this contact Id to determine which account should be soft credited for the gift
+                    // when the hard credited account is a giving arm for more than one household
+                    if (!String.isBlank(o.npe01__Contact_Id_for_Role__c) && contactToAccountIds.containsKey(o.npe01__Contact_Id_for_Role__c)) {
+                        npsp__Account_Soft_Credit__c acctSoftCred = new npsp__Account_Soft_Credit__c(
+                            npsp__Opportunity__c = o.Id,
+                            npsp__Account__c = contactToAccountIds.get(o.npe01__Contact_Id_for_Role__c),
+                            npsp__Amount__c = o.Amount,
+                            CurrencyIsoCode = o.CurrencyIsoCode,
+                            npsp__Role__c = 'Donation Source');
+                        acctSoftCreditsToInsert.add(acctSoftCred);                        
+                    }
+                    else {
+                        ConnectApi.FeedItemInput feedItemInput = new ConnectApi.FeedItemInput();                
+                        ConnectApi.MentionSegmentInput mentionSegmentInput = new ConnectApi.MentionSegmentInput();
+                        ConnectApi.MessageBodyInput messageBodyInput = new ConnectApi.MessageBodyInput();
+                        
+                        messageBodyInput.messageSegments = new List<ConnectApi.MessageSegmentInput>();
+                        
+                        ConnectApi.TextSegmentInput textSegmentInput1 = new ConnectApi.TextSegmentInput();                
+                        textSegmentInput1.text = 'Hey, ';
+                        messageBodyInput.messageSegments.add(textSegmentInput1);
+                        
+                        if (!gbo.isEmpty()) {
+                            mentionSegmentInput.id = gbo[0].Id;
+                            messageBodyInput.messageSegments.add(mentionSegmentInput);
+                        }
+                        else {
+                            ConnectApi.TextSegmentInput textSegmentInput2 = new ConnectApi.TextSegmentInput();                    
+                            textSegmentInput2.text = 'GBO Team';
+                            messageBodyInput.messageSegments.add(textSegmentInput2);                    
+                        }
+                        
+                        ConnectApi.TextSegmentInput textSegmentInput3 = new ConnectApi.TextSegmentInput();
+                        textSegmentInput3.text = ': The account to which this hard credit just posted appears to be a giving arm for more than one household. ' +
+                            'Please determine which affiliated household is responsible for the gift. ' +
+                            'Please also check to see whether the household has any open major gifts. If this credit fulfills a commitment on a household gift, ' +
+                            'change the record type and name on the giving arm credit to match the household gift, ' +
+                            'then delete the latter; or, if the credit represents only a portion of the amount expected on the household gift, ' +
+                            'link the credit to the open gift and update the remaining projected amount.';
+                        messageBodyInput.messageSegments.add(textSegmentInput3);                
+                        
+                        feedItemInput.body = messageBodyInput;
+                        feedItemInput.feedElementType = ConnectApi.FeedElementType.FeedItem;
+                        feedItemInput.subjectId = o.Id;
+                        if (!Test.isRunningTest()) {ConnectApi.ChatterFeeds.postFeedElement(Network.getNetworkId(), feedItemInput);} 
+                    }
+                }                             
+            }
+        }
+		if (!acctSoftCreditsToInsert.isEmpty()) {
+            Database.saveResult[] saveResults = Database.insert(acctSoftCreditsToInsert, false);
+            for (Integer i=0;i<saveResults.size();i++) {
+                if (saveResults.get(i).isSuccess()) {
+                    // Operation was successful, so get the ID of the record that was processed
+                    System.debug('Successfully created account soft credit. Record Id: ' + saveResults.get(i).getId());
+                }
+                else {
+                    System.debug('The record could not be created due to the following error:');                    
+                    Database.Error error = saveResults.get(i).getErrors().get(0);
+                }
+            }
+        }
+        
+    }
+
+}
